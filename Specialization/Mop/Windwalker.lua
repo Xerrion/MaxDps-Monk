@@ -1,287 +1,334 @@
 local _, addonTable = ...
 local Monk = addonTable.Monk
-local MaxDps = _G.MaxDps
+local MaxDps = rawget(_G or {}, 'MaxDps')
 if not MaxDps then return end
 local setSpell
+local Common = Monk and Monk.MopCommon
 
-local UnitPower = UnitPower
-local UnitHealth = UnitHealth
-local UnitAura = C_UnitAuras.GetAuraDataByIndex
-local UnitAuraByName = C_UnitAuras.GetAuraDataBySpellName
-local UnitHealthMax = UnitHealthMax
-local UnitPowerMax = UnitPowerMax
-local SpellHaste
-local SpellCrit
-local GetSpellInfo = C_Spell.GetSpellInfo
-local GetSpellCooldown = C_Spell.GetSpellCooldown
-local GetSpellCount = C_Spell.GetSpellCastCount
+-- =========================
+-- Tunables
+-- =========================
+local AOE_THRESHOLD_RAID  = 4   -- AoE branch in raids
+local AOE_THRESHOLD_OTHER = 3   -- AoE branch in dungeons/solo
+local JAB_MIN_ENERGY      = 40  -- only Jab when we have at least this much Energy
+local TEB_MIN_STACKS      = 10  -- glow/suggest Tigereye Brew at this stack count (unless dumping before TTD)
+local TEB_DUMP_TTD        = 12  -- if target will die soon (<= this time), dump any TEB stacks
+local FOF_TTD_MIN         = 5.5 -- minimum remaining TTD to commit to Fists of Fury
+local FOF_MIN_HP_PCT      = 15  -- allow FoF on non-bosses only if target HP% is above this
 
-local ManaPT = Enum.PowerType.Mana
-local RagePT = Enum.PowerType.Rage
-local FocusPT = Enum.PowerType.Focus
-local EnergyPT = Enum.PowerType.Energy
-local ComboPointsPT = Enum.PowerType.ComboPoints
-local RunesPT = Enum.PowerType.Runes
-local RunicPowerPT = Enum.PowerType.RunicPower
-local SoulShardsPT = Enum.PowerType.SoulShards
-local DemonicFuryPT = Enum.PowerType.DemonicFury
-local BurningEmbersPT = Enum.PowerType.BurningEmbers
-local LunarPowerPT = Enum.PowerType.LunarPower
-local HolyPowerPT = Enum.PowerType.HolyPower
-local MaelstromPT = Enum.PowerType.Maelstrom
-local ChiPT = Enum.PowerType.Chi
-local InsanityPT = Enum.PowerType.Insanity
-local ArcaneChargesPT = Enum.PowerType.ArcaneCharges
-local FuryPT = Enum.PowerType.Fury
-local PainPT = Enum.PowerType.Pain
-local EssencePT = Enum.PowerType.Essence
-local RuneBloodPT = Enum.PowerType.RuneBlood
-local RuneFrostPT = Enum.PowerType.RuneFrost
-local RuneUnholyPT = Enum.PowerType.RuneUnholy
+-- Chi costs (MoP)
+local CHI_COST_TP  = 1
+local CHI_COST_RSK = 2
+local CHI_COST_BOK = 2
 
-local fd
-local ttd
-local timeShift
-local gcd
-local cooldown
-local buff
-local debuff
-local talents
-local targets
-local targetHP
-local targetmaxHP
-local targethealthPerc
-local curentHP
-local maxHP
-local healthPerc
-local timeInCombat
-local className, classFilename, classId = UnitClass('player')
-local classtable
-local LibRangeCheck = LibStub('LibRangeCheck-3.0', true)
+-- =========================
+-- API / Locals
+-- =========================
+local UnitPower, UnitPowerMax              = UnitPower, UnitPowerMax
+local UnitChannelInfo, GetShapeshiftFormID = UnitChannelInfo, GetShapeshiftFormID
+local EnergyPT, ChiPT                      = Enum.PowerType.Energy, Enum.PowerType.Chi
 
-local Chi
-local ChiMax
-local ChiDeficit
-local Energy
-local EnergyMax
-local EnergyDeficit
-local EnergyRegen
-local EnergyTimeToMax
-local Mana
-local ManaMax
-local ManaDeficit
-
-local stance
-
+-- Frame State
+local fd, ttd, cooldown, talents, targets, classtable
+local Chi, ChiMax, Energy, EnergyMax, EnergyRegen, EnergyTimeToMax, stance
+local curHP
 local Windwalker = {}
 
+-- =========================
+-- Shared helpers (from Common)
+-- =========================
+local ContentMode   = Common and Common.ContentMode
+local IsBossOrElite = Common and Common.IsBossOrElite
+local TargetHpPct   = Common and Common.TargetHpPct
 
+local function Buff(id)       return Common and Common.Buff(fd, id) end
+local function Debuff(id)     return Common and Common.Debuff(fd, id) end
+local AuraUp                  = Common and Common.AuraUp
+local AuraRem                 = Common and Common.AuraRem
+local function IsReady(id)    return Common and Common.IsReady(fd, id) end
+local function CountBuffStacks(buffId) return Common and Common.CountBuff(fd, buffId) end
 
-local function twoh_check()
-   local leftwep = GetInventoryItemLink('player',16)
-   local leftwepSubType = leftwep and select(13, C_Item.GetItemInfo(leftwep))
-   local rightwep = GetInventoryItemLink('player',17)
-   local rightwepSubType = rightwep and select(13, C_Item.GetItemInfo(rightwep))
-   if leftwepSubType == (1 or 5 or 6 or 8) then
-      return true
-   end
+local function Usable(id, label)     return Common and Common.Usable and Common.Usable(fd, id, label) end
+local function TrySet(id, label)
+    if Common and Common.Usable and Common.TrySet then
+        if Common.Usable(fd, id, label) then
+            setSpell = Common.TrySet(setSpell, fd, id, label)
+        end
+    end
 end
 
+local function HasChi(n) return Chi and Chi >= n end
+local function RskReady() return IsReady(classtable.RisingSunKick) end
 
-local function IsComboStrike(spell)
-    if MaxDps and MaxDps.spellHistory then
-        if MaxDps.spellHistory[1] then
-            if MaxDps.spellHistory[1] ~= spell then
-                return true
-            end
-            if MaxDps.spellHistory[1] == spell then
-                return false
+-- =========================
+-- Ability gates
+-- =========================
+local function CanTouchOfDeath()
+    local tod = classtable.TouchOfDeath
+    if not tod or not IsReady(tod) then return false end
+    if not MaxDps:CheckSpellUsable(tod, 'TouchOfDeath') then return false end
+    if UnitClassification('target') == 'worldboss' then return false end
+    return UnitHealth('target') > 0 and UnitHealth('target') <= curHP
+end
+
+local function CanFoF()
+    local rskCd  = cooldown and cooldown[classtable.RisingSunKick]
+    local rskRem = (rskCd and rskCd.remains) or 0
+    return MaxDps:CheckSpellUsable(classtable.FistsofFury, 'FistsofFury')
+       and IsReady(classtable.FistsofFury)
+       and not AuraUp(Buff(classtable.EnergizingBrew))
+       and EnergyTimeToMax > 4
+       and AuraRem(Buff(classtable.TigerPowerBuff)) > 4
+       and AuraUp(Debuff(classtable.RisingSunKickDeBuff))
+       and rskRem > 4.5
+       and ttd > FOF_TTD_MIN
+       and (IsBossOrElite() or TargetHpPct() > FOF_MIN_HP_PCT)
+end
+
+-- =========================
+-- Rotations
+-- =========================
+function Windwalker:single()
+    -- Off-GCD/low-cost
+    if talents[classtable.ChiWave] and EnergyTimeToMax > 2 then
+        TrySet(classtable.ChiWave, 'ChiWave')
+    end
+    if talents[classtable.ChiBurst] and MaxDps:CheckSpellUsable(classtable.ChiBurst, 'ChiBurst') then
+        MaxDps:GlowCooldown(classtable.ChiBurst, IsReady(classtable.ChiBurst))
+    end
+    if talents[classtable.ZenSphere]
+       and not AuraUp(Debuff(classtable.ZenSphereDeBuff))
+       and EnergyTimeToMax > 2 then
+        TrySet(classtable.ZenSphere, 'ZenSphere')
+    end
+
+    -- Combo Breakers
+    if AuraUp(Buff(classtable.ComboBreakerTpBuff))
+       and (AuraRem(Buff(classtable.ComboBreakerTpBuff)) <= 2 or EnergyTimeToMax >= 2) then
+        TrySet(classtable.TigerPalm, 'TigerPalm')
+    end
+
+    -- Maintain Tiger Power unless CB:BoK is waiting; don't snipe Chi from an imminent RSK
+    do
+        local hasCBTP = AuraUp(Buff(classtable.ComboBreakerTpBuff))
+        if AuraRem(Buff(classtable.TigerPowerBuff)) < 2
+           and not AuraUp(Buff(classtable.ComboBreakerBokBuff))
+           and (hasCBTP or HasChi(CHI_COST_TP)) then
+            if hasCBTP or (not RskReady()) or HasChi(CHI_COST_RSK + CHI_COST_TP) then
+                TrySet(classtable.TigerPalm, 'TigerPalm')
             end
         end
     end
-    return true
+
+    -- Builder
+    if Energy >= JAB_MIN_ENERGY and (ChiMax - Chi) >= 2 then
+        TrySet(classtable.Jab, 'Jab')
+    end
+
+    -- Filler spender (require Chi unless CB:BoK)
+    local rskRem = ((cooldown[classtable.RisingSunKick] and cooldown[classtable.RisingSunKick].remains) or 0)
+    if (HasChi(CHI_COST_BOK) or AuraUp(Buff(classtable.ComboBreakerBokBuff)))
+       and (Energy + EnergyRegen * rskRem) >= 40 then
+        TrySet(classtable.BlackoutKick, 'BlackoutKick')
+    end
 end
 
-
-
-function Windwalker:precombat()
-    --if (MaxDps:CheckSpellUsable(classtable.Stance, 'Stance')) and cooldown[classtable.Stance].ready and not UnitAffectingCombat('player') then
-    --    if not setSpell then setSpell = classtable.Stance end
-    --end
-    --if (MaxDps:CheckSpellUsable(classtable.VirmensBitePotion, 'VirmensBitePotion')) and cooldown[classtable.VirmensBitePotion].ready and not UnitAffectingCombat('player') then
-    --    if not setSpell then setSpell = classtable.VirmensBitePotion end
-    --end
-end
 function Windwalker:aoe()
-    if (MaxDps:CheckSpellUsable(classtable.RushingJadeWind, 'RushingJadeWind') and talents[classtable.RushingJadeWind]) and ((talents[classtable.RushingJadeWind] and true or false)) and cooldown[classtable.RushingJadeWind].ready then
-        if not setSpell then setSpell = classtable.RushingJadeWind end
+    if talents[classtable.RushingJadeWind] then
+        TrySet(classtable.RushingJadeWind, 'RushingJadeWind')
     end
-    if (MaxDps:CheckSpellUsable(classtable.ZenSphere, 'ZenSphere') and talents[classtable.ZenSphere]) and ((talents[classtable.ZenSphere] and true or false) and not debuff[classtable.ZenSphereDeBuff].up) and cooldown[classtable.ZenSphere].ready then
-        if not setSpell then setSpell = classtable.ZenSphere end
+    if talents[classtable.ChiWave] and EnergyTimeToMax > 1.5 then
+        TrySet(classtable.ChiWave, 'ChiWave')
     end
-    if (MaxDps:CheckSpellUsable(classtable.ChiWave, 'ChiWave') and talents[classtable.ChiWave]) and ((talents[classtable.ChiWave] and true or false)) and cooldown[classtable.ChiWave].ready then
-        if not setSpell then setSpell = classtable.ChiWave end
+    if talents[classtable.ChiBurst] and MaxDps:CheckSpellUsable(classtable.ChiBurst, 'ChiBurst') then
+        MaxDps:GlowCooldown(classtable.ChiBurst, IsReady(classtable.ChiBurst))
     end
-    if (MaxDps:CheckSpellUsable(classtable.ChiBurst, 'ChiBurst') and talents[classtable.ChiBurst]) and ((talents[classtable.ChiBurst] and true or false)) and cooldown[classtable.ChiBurst].ready then
-        MaxDps:GlowCooldown(classtable.ChiBurst, cooldown[classtable.ChiBurst].ready)
+
+    -- Keep Tiger Power; don't block imminent RSK unless CB:TP is free
+    do
+        local hasCBTP = AuraUp(Buff(classtable.ComboBreakerTpBuff))
+        if AuraRem(Buff(classtable.TigerPowerBuff)) < 2
+           and not AuraUp(Buff(classtable.ComboBreakerBokBuff))
+           and (hasCBTP or HasChi(CHI_COST_TP)) then
+            if hasCBTP or (not RskReady()) or HasChi(CHI_COST_RSK + CHI_COST_TP) then
+                TrySet(classtable.TigerPalm, 'TigerPalm')
+            end
+        end
     end
-    if (MaxDps:CheckSpellUsable(classtable.RisingSunKick, 'RisingSunKick')) and (Chi == ChiMax) and cooldown[classtable.RisingSunKick].ready then
-        if not setSpell then setSpell = classtable.RisingSunKick end
+
+    if (not talents[classtable.RushingJadeWind]) and Chi < ChiMax then
+        TrySet(classtable.SpinningCraneKick, 'SpinningCraneKick')
     end
-    if (MaxDps:CheckSpellUsable(classtable.SpinningCraneKick, 'SpinningCraneKick')) and (not (talents[classtable.RushingJadeWind] and true or false)) and cooldown[classtable.SpinningCraneKick].ready then
-        if not setSpell then setSpell = classtable.SpinningCraneKick end
+    if Energy >= JAB_MIN_ENERGY and (ChiMax - Chi) >= 2 then
+        TrySet(classtable.Jab, 'Jab')
     end
-end
-function Windwalker:single_target()
-    if (MaxDps:CheckSpellUsable(classtable.RisingSunKick, 'RisingSunKick')) and cooldown[classtable.RisingSunKick].ready then
-        if not setSpell then setSpell = classtable.RisingSunKick end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.FistsofFury, 'FistsofFury')) and (not buff[classtable.EnergizingBrewBuff].up and EnergyTimeToMax >4 and buff[classtable.TigerPowerBuff].remains >4) and cooldown[classtable.FistsofFury].ready then
-        if not setSpell then setSpell = classtable.FistsofFury end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.ChiWave, 'ChiWave') and talents[classtable.ChiWave]) and ((talents[classtable.ChiWave] and true or false) and EnergyTimeToMax >2) and cooldown[classtable.ChiWave].ready then
-        if not setSpell then setSpell = classtable.ChiWave end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.ChiBurst, 'ChiBurst') and talents[classtable.ChiBurst]) and ((talents[classtable.ChiBurst] and true or false) and EnergyTimeToMax >2) and cooldown[classtable.ChiBurst].ready then
-        MaxDps:GlowCooldown(classtable.ChiBurst, cooldown[classtable.ChiBurst].ready)
-    end
-    if (MaxDps:CheckSpellUsable(classtable.ZenSphere, 'ZenSphere') and talents[classtable.ZenSphere]) and ((talents[classtable.ZenSphere] and true or false) and EnergyTimeToMax >2 and not debuff[classtable.ZenSphereDeBuff].up) and cooldown[classtable.ZenSphere].ready then
-        if not setSpell then setSpell = classtable.ZenSphere end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.BlackoutKick, 'BlackoutKick')) and (buff[classtable.ComboBreakerBokBuff].up) and cooldown[classtable.BlackoutKick].ready then
-        if not setSpell then setSpell = classtable.BlackoutKick end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.TigerPalm, 'TigerPalm')) and (buff[classtable.ComboBreakerTpBuff].up and ( buff[classtable.ComboBreakerTpBuff].remains <= 2 or EnergyTimeToMax >= 2 )) and cooldown[classtable.TigerPalm].ready then
-        if not setSpell then setSpell = classtable.TigerPalm end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.Jab, 'Jab')) and (ChiMax - Chi >= 2) and cooldown[classtable.Jab].ready then
-        if not setSpell then setSpell = classtable.Jab end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.BlackoutKick, 'BlackoutKick')) and (Energy + EnergyRegen * cooldown[classtable.RisingSunKick].remains >= 40) and cooldown[classtable.BlackoutKick].ready then
-        if not setSpell then setSpell = classtable.BlackoutKick end
+    local rskRem = ((cooldown[classtable.RisingSunKick] and cooldown[classtable.RisingSunKick].remains) or 0)
+    if (HasChi(CHI_COST_BOK) or AuraUp(Buff(classtable.ComboBreakerBokBuff)))
+       and (Energy + EnergyRegen * rskRem) >= 40 then
+        TrySet(classtable.BlackoutKick, 'BlackoutKick')
     end
 end
 
-
-local function ClearCDs()
+local function ClearGlows()
     MaxDps:GlowCooldown(classtable.ChiBurst, false)
     MaxDps:GlowCooldown(classtable.EnergizingBrew, false)
+    MaxDps:GlowCooldown(classtable.TigereyeBrew, false)
 end
 
-function Windwalker:callaction()
-    if (MaxDps:CheckSpellUsable(classtable.StanceoftheFierceTiger, 'StanceoftheFierceTiger')) and (stance ~= 24) and cooldown[classtable.StanceoftheFierceTiger].ready then
-        if not setSpell then setSpell = classtable.StanceoftheFierceTiger end
+function Windwalker:callaction(mode)
+    -- Stance
+    if stance ~= 24 then
+        TrySet(classtable.StanceoftheFierceTiger, 'StanceoftheFierceTiger')
     end
-    --if (MaxDps:CheckSpellUsable(classtable.StanceoftheFierceTiger, 'StanceoftheFierceTiger')) and (not buff[classtable.StanceoftheFierceTigerBuff].up) and cooldown[classtable.StanceoftheFierceTiger].ready then
-    --    if not setSpell then setSpell = classtable.StanceoftheFierceTiger end
-    --end
-    if (MaxDps:CheckSpellUsable(classtable.ChiSphere, 'ChiSphere')) and ((talents[classtable.PowerStrikes] and true or false) and buff[classtable.ChiSphereBuff].up and Chi <4) and cooldown[classtable.ChiSphere].ready then
-        if not setSpell then setSpell = classtable.ChiSphere end
+
+    -- Builders
+    if talents[classtable.PowerStrikes]
+       and Usable(classtable.ChiSphere, 'ChiSphere')
+       and AuraUp(Buff(classtable.ChiSphereBuff))
+       and Chi < 4 then
+        TrySet(classtable.ChiSphere, 'ChiSphere')
     end
-    --if (MaxDps:CheckSpellUsable(classtable.VirmensBitePotion, 'VirmensBitePotion')) and (MaxDps:Bloodlust(1) or ttd <= 60) and cooldown[classtable.VirmensBitePotion].ready then
-    --    if not setSpell then setSpell = classtable.VirmensBitePotion end
-    --end
-    if (MaxDps:CheckSpellUsable(classtable.ChiBrew, 'ChiBrew') and talents[classtable.ChiBrew]) and ((talents[classtable.ChiBrew] and true or false) and Chi <= 2 and ( ( cooldown[classtable.ChiBrew].charges == 1 and cooldown[classtable.ChiBrew].partialRecharge <= 10 ) or cooldown[classtable.ChiBrew].charges == 2 or ttd <cooldown[classtable.ChiBrew].charges * 10 )) and cooldown[classtable.ChiBrew].ready then
-        if not setSpell then setSpell = classtable.ChiBrew end
+    local chiBrewCD = cooldown[classtable.ChiBrew] or {}
+    if talents[classtable.ChiBrew]
+       and MaxDps:CheckSpellUsable(classtable.ChiBrew, 'ChiBrew')
+       and Chi <= 2
+       and (chiBrewCD.charges or 0) >= 1 then
+        TrySet(classtable.ChiBrew, 'ChiBrew')
     end
-    if (MaxDps:CheckSpellUsable(classtable.TigerPalm, 'TigerPalm')) and (buff[classtable.TigerPowerBuff].remains <= 3) and cooldown[classtable.TigerPalm].ready then
-        if not setSpell then setSpell = classtable.TigerPalm end
+
+    -- Highest: CB:BoK
+    if AuraUp(Buff(classtable.ComboBreakerBokBuff)) then
+        TrySet(classtable.BlackoutKick, 'BlackoutKick')
     end
-    if (MaxDps:CheckSpellUsable(classtable.TigereyeBrew, 'TigereyeBrew')) and (not buff[classtable.TigereyeBrewUseBuff].up and buff[classtable.TigereyeBrewBuff].count == 20) and cooldown[classtable.TigereyeBrew].ready then
-        if not setSpell then setSpell = classtable.TigereyeBrew end
+    -- Next: CB:TP
+    if AuraUp(Buff(classtable.ComboBreakerTpBuff)) then
+        TrySet(classtable.TigerPalm, 'TigerPalm')
     end
-    --if (MaxDps:CheckSpellUsable(classtable.TigereyeBrew, 'TigereyeBrew')) and (not buff[classtable.TigereyeBrewUseBuff].up) and cooldown[classtable.TigereyeBrew].ready then
-    --    if not setSpell then setSpell = classtable.TigereyeBrew end
-    --end
-    if (MaxDps:CheckSpellUsable(classtable.TigereyeBrew, 'TigereyeBrew')) and (not buff[classtable.TigereyeBrewUseBuff].up and Chi >= 2 and ( buff[classtable.TigereyeBrewBuff].count >= 10 or ttd <40 ) and debuff[classtable.RisingSunKickDeBuff].up and buff[classtable.TigerPowerBuff].up) and cooldown[classtable.TigereyeBrew].ready then
-        if not setSpell then setSpell = classtable.TigereyeBrew end
+
+    -- Maintenance (Chi-gated unless free CB:TP); don't block imminent RSK
+    do
+        local hasCBTP = AuraUp(Buff(classtable.ComboBreakerTpBuff))
+        if not AuraUp(Buff(classtable.TigerPowerBuff))
+           and (hasCBTP or HasChi(CHI_COST_TP)) then
+            if hasCBTP or (not RskReady()) or HasChi(CHI_COST_RSK + CHI_COST_TP) then
+                TrySet(classtable.TigerPalm, 'TigerPalm')
+            end
+        end
     end
-    if (MaxDps:CheckSpellUsable(classtable.EnergizingBrew, 'EnergizingBrew')) and (EnergyTimeToMax >5) and cooldown[classtable.EnergizingBrew].ready then
-        --if not setSpell then setSpell = classtable.EnergizingBrew end
+    if not AuraUp(Debuff(classtable.RisingSunKickDeBuff)) and HasChi(CHI_COST_RSK) then
+        TrySet(classtable.RisingSunKick, 'RisingSunKick')
+    end
+
+    -- Tigereye Brew: glow normally; suggest only when a big window is imminent
+    do
+        local stacks  = CountBuffStacks(classtable.TigereyeBrewStackBuff)
+        local ready   = IsReady(classtable.TigereyeBrew)
+        local active  = AuraUp(Buff(classtable.TigereyeBrewUseBuff))
+
+        local rskCd   = cooldown and cooldown[classtable.RisingSunKick]
+        local rskRem  = (rskCd and rskCd.remains) or 0
+        local windowSoon = (rskRem <= 1.0) or CanFoF()  -- RSK about to be pressed or FoF gates pass
+
+        local dumpSoon   = (ttd > 0 and ttd <= TEB_DUMP_TTD and stacks >= 3)
+        local shouldGlow = ready and (not active) and (
+            stacks >= TEB_MIN_STACKS or dumpSoon or (windowSoon and stacks >= math.max(5, TEB_MIN_STACKS - 2))
+        )
+
+        MaxDps:GlowCooldown(classtable.TigereyeBrew, shouldGlow)
+
+        -- Only suggest/cast when a burst window is imminent and we have full value stacks
+        if shouldGlow and windowSoon and stacks >= TEB_MIN_STACKS
+           and MaxDps:CheckSpellUsable(classtable.TigereyeBrew, 'TigereyeBrew') then
+            if not setSpell then setSpell = classtable.TigereyeBrew end
+        end
+    end
+
+    -- Core CDs
+    if CanTouchOfDeath() then
+        TrySet(classtable.TouchOfDeath, 'TouchOfDeath')
+    end
+    if CanFoF() then
+        TrySet(classtable.FistsofFury, 'FistsofFury')
+    end
+
+    -- RSK on cooldown (Chi-gated)
+    if HasChi(CHI_COST_RSK) then
+        TrySet(classtable.RisingSunKick, 'RisingSunKick')
+    end
+
+    -- Invoke Xuen
+    if talents[classtable.InvokeXuen] and Usable(classtable.InvokeXuen, 'InvokeXuen') then
+        local boss = IsBossOrElite()
+        if (mode == 'solo' and boss) or (mode ~= 'solo' and (targets >= 3 or boss)) then
+            TrySet(classtable.InvokeXuen, 'InvokeXuen')
+        end
+    end
+
+    -- Energizing Brew glow
+    if Usable(classtable.EnergizingBrew, 'EnergizingBrew') and EnergyTimeToMax > 5 then
         MaxDps:GlowCooldown(classtable.EnergizingBrew, true)
     end
-    if (MaxDps:CheckSpellUsable(classtable.RisingSunKick, 'RisingSunKick')) and (not debuff[classtable.RisingSunKickDeBuff].up) and cooldown[classtable.RisingSunKick].ready then
-        if not setSpell then setSpell = classtable.RisingSunKick end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.TigerPalm, 'TigerPalm')) and (not buff[classtable.TigerPowerBuff].up and debuff[classtable.RisingSunKickDeBuff].remains >1 and EnergyTimeToMax >1) and cooldown[classtable.TigerPalm].ready then
-        if not setSpell then setSpell = classtable.TigerPalm end
-    end
-    if (MaxDps:CheckSpellUsable(classtable.InvokeXuen, 'InvokeXuen') and talents[classtable.InvokeXuen]) and ((talents[classtable.InvokeXuen] and true or false)) and cooldown[classtable.InvokeXuen].ready then
-        if not setSpell then setSpell = classtable.InvokeXuen end
-    end
-    if (targets >= 3) then
+
+    -- Choose ST vs AoE
+    local aoeThreshold = (mode == 'raid') and AOE_THRESHOLD_RAID or AOE_THRESHOLD_OTHER
+    if targets >= aoeThreshold then
         Windwalker:aoe()
-    end
-    if (targets <3) then
-        Windwalker:single_target()
+    else
+        Windwalker:single()
     end
 end
+
 function Monk:Windwalker()
-    fd = MaxDps.FrameData
-    ttd = (fd.timeToDie and fd.timeToDie) or 500
-    timeShift = fd.timeShift
-    gcd = fd.gcd
-    cooldown = fd.cooldown
-    buff = fd.buff
-    debuff = fd.debuff
-    talents = fd.talents
-    targets = MaxDps:SmartAoe()
-    Mana = UnitPower('player', ManaPT)
-    ManaMax = UnitPowerMax('player', ManaPT)
-    ManaDeficit = ManaMax - Mana
-    targetHP = UnitHealth('target')
-    targetmaxHP = UnitHealthMax('target')
-    targethealthPerc = (targetHP >0 and targetmaxHP >0 and (targetHP / targetmaxHP) * 100) or 100
-    curentHP = UnitHealth('player')
-    maxHP = UnitHealthMax('player')
-    healthPerc = (curentHP / maxHP) * 100
-    timeInCombat = MaxDps.combatTime or 0
-    classtable = MaxDps.SpellTable
-    SpellHaste = UnitSpellHaste('player')
-    SpellCrit = GetCritChance()
-    Chi = UnitPower('player', ChiPT)
-    ChiMax = UnitPowerMax('player', ChiPT)
-    ChiDeficit = ChiMax - Chi
-    Energy = UnitPower('player', EnergyPT)
+    fd        = MaxDps.FrameData
+    ttd       = (fd.timeToDie and fd.timeToDie) or 500
+    cooldown  = fd.cooldown or {}
+    talents   = fd.talents or {}
+    targets   = MaxDps:SmartAoe()
+    classtable= MaxDps.SpellTable
+
+    Chi       = UnitPower('player', ChiPT)
+    ChiMax    = UnitPowerMax('player', ChiPT)
+    Energy    = UnitPower('player', EnergyPT)
     EnergyMax = UnitPowerMax('player', EnergyPT)
-    EnergyDeficit = EnergyMax - Energy
-    EnergyRegen = GetPowerRegenForPowerType(Enum.PowerType.Energy)
-    EnergyTimeToMax = EnergyDeficit / EnergyRegen
-    stance = GetShapeshiftFormID()
-    --for spellId in pairs(MaxDps.Flags) do
-    --    self.Flags[spellId] = false
-    --    self:ClearGlowIndependent(spellId, spellId)
-    --end
+    EnergyRegen     = (fd.energyRegen and fd.energyRegen) or 10
+    EnergyTimeToMax = (EnergyMax - Energy) / math.max(EnergyRegen, 0.001)
+    stance          = GetShapeshiftFormID()
+    curHP           = UnitHealth('player')
 
-    classtable.RisingSunKickDeBuff = 130320
-    classtable.StanceoftheFierceTiger = 103985
-    classtable.TigerPowerBuff = 125359
-    classtable.TigereyeBrewBuff = 1247279
-    classtable.TigereyeBrewUseBuff = 1247275
+    -- Fallback IDs
+    classtable.RisingSunKickDeBuff    = classtable.RisingSunKickDeBuff or 130320
+    classtable.StanceoftheFierceTiger = classtable.StanceoftheFierceTiger or 103985
+    classtable.TigerPowerBuff         = classtable.TigerPowerBuff or 125359
 
-    classtable.ChiSphere = 124081
-    classtable.InvokeXuen = 123904
+    -- Tigereye Brew auras / press
+    classtable.TigereyeBrewStackBuff  = classtable.TigereyeBrewStackBuff or 1247279 -- stacks aura
+    classtable.TigereyeBrewUseBuff    = classtable.TigereyeBrewUseBuff   or 1247275 -- ACTIVE dmg buff
+    classtable.TigereyeBrew           = classtable.TigereyeBrew          or 116740  -- press
 
-    local function debugg()
-        talents[classtable.PowerStrikes] = 1
-        talents[classtable.ChiBrew] = 1
-        talents[classtable.InvokeXuen] = 1
-        talents[classtable.RushingJadeWind] = 1
-        talents[classtable.ZenSphere] = 1
-        talents[classtable.ChiWave] = 1
-        talents[classtable.ChiBurst] = 1
-    end
-
-
-    --if MaxDps.db.global.debugMode then
-    --   debugg()
-    --end
+    classtable.ChiSphere              = classtable.ChiSphere or 124081
+    classtable.InvokeXuen             = classtable.InvokeXuen or 123904
+    classtable.FistsofFury            = classtable.FistsofFury or 113656
+    classtable.RushingJadeWind        = classtable.RushingJadeWind or 116847
+    classtable.SpinningCraneKick      = classtable.SpinningCraneKick or 101546
+    classtable.ChiBurst               = classtable.ChiBurst or 123986
+    classtable.ChiWave                = classtable.ChiWave or 115098
+    classtable.TouchOfDeath           = classtable.TouchOfDeath or 115080
+    classtable.EnergizingBrew         = classtable.EnergizingBrew or 115288
+    classtable.TigerPalm              = classtable.TigerPalm or 100787
+    classtable.RisingSunKick          = classtable.RisingSunKick or 107428
+    classtable.BlackoutKick           = classtable.BlackoutKick or 100784
+    classtable.Jab                    = classtable.Jab or 100780
+    classtable.ChiBrew                = classtable.ChiBrew or 115399
+    classtable.ChiSphereBuff          = classtable.ChiSphereBuff or 129914
+    classtable.ComboBreakerBokBuff    = classtable.ComboBreakerBokBuff or 116768
+    classtable.ComboBreakerTpBuff     = classtable.ComboBreakerTpBuff or 118864
 
     setSpell = nil
-    ClearCDs()
+    ClearGlows()
+    local mode = ContentMode()
+    Windwalker:callaction(mode)
 
-    Windwalker:precombat()
-
-    Windwalker:callaction()
-    if setSpell then return setSpell end
+    if setSpell then
+        return setSpell
+    end
 end
